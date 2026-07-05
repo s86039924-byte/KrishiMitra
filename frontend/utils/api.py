@@ -1,7 +1,20 @@
-"""Thin HTTP client for the KrishiMitra AI backend."""
+"""Thin HTTP client for the KrishiMitra AI backend.
+
+Resilient to Render free-tier cold starts: the backend spins down after ~15 min
+idle, and the first request while it wakes returns 502/503/504 (or times out).
+We transparently retry those transient failures with a short backoff so the user
+just sees a slightly slower first request instead of an error.
+"""
+import json
 import os
+import time
 
 import requests
+
+# Gateway statuses that mean "backend waking / temporarily unavailable" — retry.
+_TRANSIENT_STATUS = {502, 503, 504}
+# Backoff (seconds) between retries — sized to cover a free-tier cold start.
+_BACKOFF = [4, 10, 18]
 
 
 def _resolve(key: str, default: str) -> str:
@@ -45,8 +58,43 @@ def _extract_error(resp: requests.Response) -> APIError:
     return APIError(f"Request failed ({resp.status_code}).")
 
 
+def _request(method: str, path: str, *, retries: int = 3, timeout: int | None = None,
+             **kwargs) -> requests.Response:
+    """Send a request, retrying transient gateway errors and cold-start timeouts.
+
+    Note: we pass request bodies as bytes/plain values (not file handles), so a
+    retry safely re-sends the same payload.
+    """
+    url = f"{BACKEND_URL}{path}"
+    timeout = timeout or TIMEOUT
+    last_error: APIError | None = None
+
+    for attempt in range(retries):
+        try:
+            resp = requests.request(method, url, timeout=timeout, **kwargs)
+        except (requests.ConnectionError, requests.Timeout):
+            last_error = APIError(
+                "The backend is waking up (free hosting sleeps when idle). "
+                "Please wait a moment and try again — the first request can take ~30–50s.",
+                "backend_unreachable",
+            )
+        else:
+            if resp.status_code not in _TRANSIENT_STATUS:
+                return resp
+            last_error = APIError(
+                "The backend is starting up. Retrying automatically…", "backend_waking"
+            )
+
+        # Transient failure — back off and retry (unless this was the last try).
+        if attempt < retries - 1:
+            time.sleep(_BACKOFF[min(attempt, len(_BACKOFF) - 1)])
+
+    raise last_error or APIError("Request failed after several retries.")
+
+
 def health() -> dict:
-    resp = requests.get(f"{BACKEND_URL}/health", timeout=10)
+    # Short timeout, no long retries — this runs on every rerun for the sidebar.
+    resp = _request("GET", "/health", retries=1, timeout=8)
     resp.raise_for_status()
     return resp.json()
 
@@ -57,9 +105,7 @@ def analyze_image(
     """POST /api/analyze-image → assessment + 3 follow-up questions."""
     files = {"file": (filename, image_bytes, content_type)}
     data = {"language": language}
-    resp = requests.post(
-        f"{BACKEND_URL}/api/analyze-image", files=files, data=data, timeout=TIMEOUT
-    )
+    resp = _request("POST", "/api/analyze-image", files=files, data=data)
     if not resp.ok:
         raise _extract_error(resp)
     return resp.json()
@@ -74,17 +120,13 @@ def final_diagnosis(
     language: str = "English",
 ) -> dict:
     """POST /api/final-diagnosis → full report."""
-    import json
-
     files = {"file": (filename, image_bytes, content_type)}
     data = {
         "analysis": json.dumps(analysis),
         "answers": json.dumps(answers),
         "language": language,
     }
-    resp = requests.post(
-        f"{BACKEND_URL}/api/final-diagnosis", files=files, data=data, timeout=TIMEOUT
-    )
+    resp = _request("POST", "/api/final-diagnosis", files=files, data=data)
     if not resp.ok:
         raise _extract_error(resp)
     return resp.json()
@@ -92,11 +134,7 @@ def final_diagnosis(
 
 def translate(report: dict, language: str) -> dict:
     """POST /api/translate → report in the requested language."""
-    resp = requests.post(
-        f"{BACKEND_URL}/api/translate",
-        json={"report": report, "language": language},
-        timeout=TIMEOUT,
-    )
+    resp = _request("POST", "/api/translate", json={"report": report, "language": language})
     if not resp.ok:
         raise _extract_error(resp)
     return resp.json()["report"]
@@ -104,14 +142,7 @@ def translate(report: dict, language: str) -> dict:
 
 def generate_pdf(report: dict, language: str = "English") -> bytes:
     """POST /api/generate-pdf → PDF bytes."""
-    resp = requests.post(
-        f"{BACKEND_URL}/api/generate-pdf",
-        params={"language": language},
-        json=report,
-        timeout=TIMEOUT,
-    )
+    resp = _request("POST", "/api/generate-pdf", params={"language": language}, json=report)
     if not resp.ok:
         raise _extract_error(resp)
     return resp.content
-
-

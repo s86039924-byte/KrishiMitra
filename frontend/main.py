@@ -112,7 +112,8 @@ with st.sidebar:
         else:
             st.warning("Backend online but GOOGLE_API_KEY missing.")
     except Exception:
-        st.error("Backend offline. Start FastAPI on port 8000.")
+        st.warning("⏳ Backend is waking up (free hosting sleeps when idle). "
+                   "The first request may take ~30–50s — just retry if it fails.")
 
 
 # --------------------------------------------------------------------------- #
