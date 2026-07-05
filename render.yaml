@@ -1,0 +1,21 @@
+# One-click / IaC deploy of the KrishiMitra AI backend on Render.
+# In Render: New + → Blueprint → point at this repo. It reads this file.
+# You still set GOOGLE_API_KEY in the dashboard (it's marked sync:false = secret).
+services:
+  - type: web
+    name: krishimitra-backend
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: GOOGLE_API_KEY
+        sync: false          # set this secret in the Render dashboard
+      - key: GEMMA_MODEL
+        value: models/gemma-4-31b-it
+      - key: GEMMA_FALLBACK_MODEL
+        value: models/gemma-4-26b-a4b-it
+      - key: CORS_ORIGINS
+        value: "*"           # tighten to your Streamlit URL after first deploy
